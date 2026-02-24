@@ -1,6 +1,10 @@
 package main
 
 import "core:fmt"
+import "core:os"
+import "core:bufio"
+import "core:slice"
+import "core:strings"
 import "core:testing"
 
 MATCH_SCORE :: 12
@@ -8,6 +12,11 @@ MISMATCH_PENALTY :: 6
 
 GAP_OPEN_PENALTY :: 5
 GAP_EXTEND_PENALTY :: 1
+
+Candidate :: struct {
+	line:  string,
+	score: u16
+}
 
 saturating_sub :: proc(a, b: u16) -> u16 { return a >= b ? a - b : 0 }
 
@@ -64,11 +73,46 @@ smith_waterman :: proc(needle, haystack: string) -> u16 {
 }
 
 main :: proc() {
-	fmt.println("Hello, World!")
-	fmt.println(smith_waterman("foo", "foobar"))
-	fmt.println(smith_waterman("fob", "foobar"))
-	fmt.println(smith_waterman("xyz", "foobar"))
-	fmt.println(smith_waterman("fb", "foobar"))
+	args := os.args
+	fmt.println("Args:", args)
+	if len(args) < 2 {
+		fmt.eprintln("Usage: fast-fuzzy-matcher <query>")
+		os.exit(1)
+	}
+	needle := args[1]
+
+	fmt.println("Searching for:", needle)
+
+	candidates: [dynamic]Candidate
+	defer delete(candidates)
+
+	reader: bufio.Scanner
+	bufio.scanner_init(&reader, os.to_stream(os.stdin))
+	defer bufio.scanner_destroy(&reader)
+
+	total := 0
+	for bufio.scanner_scan(&reader) {
+		current_line := bufio.scanner_text(&reader)
+		total += 1
+
+		score := smith_waterman(needle, current_line)
+		if score > 0 {
+			append(&candidates, Candidate{
+				line = strings.clone(current_line),
+				score = score
+			})
+		}
+	}
+
+	slice.sort_by(candidates[:], proc(a, b: Candidate) -> bool {
+		return a.score > b.score
+	})
+
+	for c in candidates {
+		fmt.println(c.line)
+	}
+
+	fmt.printfln("Found %d candidates from %d", len(candidates), total)
 }
 
 @(test)
