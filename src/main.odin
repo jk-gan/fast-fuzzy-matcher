@@ -5,13 +5,76 @@ import "core:os"
 import "core:bufio"
 import "core:slice"
 import "core:strings"
+import "core:strconv"
 import "core:testing"
+import "core:thread"
+import "core:mem"
+import "base:intrinsics"
 
 MATCH_SCORE :: 12
 MISMATCH_PENALTY :: 6
 
 GAP_OPEN_PENALTY :: 5
 GAP_EXTEND_PENALTY :: 1
+
+MAX_HAYSTACK :: 512
+
+Work_Dispatcher :: struct {
+	query: string,
+	lines: []string,
+	chunk_size: int,
+	chunk_count: int,
+	next_chunk_index: int,
+}
+
+Worker_Result :: struct {
+	dispacther: ^Work_Dispatcher,
+	local_candidates: [dynamic]Candidate,
+}
+
+worker_match_lines :: proc(result: ^Worker_Result) {
+	dispatcher := result.dispacther
+	query := dispatcher.query
+	query_len := len(query)
+
+	 // Thread-local arena: reused for every line this worker processes
+    arena_buffer := make([]byte, 2 * (query_len + 1) * (MAX_HAYSTACK + 1) * size_of(u16))
+    defer delete(arena_buffer)
+
+    arena: mem.Arena
+    mem.arena_init(&arena, arena_buffer)
+    arena_allocator := mem.arena_allocator(&arena)
+
+	for {
+		chunk_index := intrinsics.atomic_add(&dispatcher.next_chunk_index, 1)
+		if chunk_index >= dispatcher.chunk_count {
+			break
+		}
+
+		start_index := chunk_index * dispatcher.chunk_size
+		end_index := min(start_index + dispatcher.chunk_size, len(dispatcher.lines))
+
+		for line in dispatcher.lines[start_index:end_index] {
+		   score: u16
+
+            // Arena buffer is sized for MAX_HAYSTACK only.
+            // Fallback for longer lines to avoid arena overflow.
+            if len(line) <= MAX_HAYSTACK {
+                    score = smith_waterman(query, line, arena_allocator)
+                    mem.arena_free_all(&arena)
+            } else {
+                    score = smith_waterman(query, line)
+            }
+
+			if score > 0 {
+				append(&result.local_candidates, Candidate{
+					line = line,
+					score = score,
+				})
+			}
+		}
+	}
+}
 
 Candidate :: struct {
 	line:  string,
@@ -21,6 +84,8 @@ Candidate :: struct {
 saturating_sub :: proc(a, b: u16) -> u16 { return a >= b ? a - b : 0 }
 
 is_subsequence :: proc(needle, haystack: string) -> bool {
+	if len(needle) > len(haystack) do return false
+
 	ni := 0
 	for hi in 0 ..< len(haystack) {
 		if ni < len(needle) && needle[ni] == haystack[hi] {
@@ -30,7 +95,7 @@ is_subsequence :: proc(needle, haystack: string) -> bool {
 	return ni == len(needle)
 }
 
-smith_waterman :: proc(needle, haystack: string) -> u16 {
+smith_waterman :: proc(needle, haystack: string, allocator := context.allocator) -> u16 {
 	needle_len := len(needle)
 	haystack_len := len(haystack)
 	if needle_len == 0 || haystack_len == 0 do return 0
@@ -39,11 +104,10 @@ smith_waterman :: proc(needle, haystack: string) -> u16 {
 	rows := needle_len + 1
 	cols := haystack_len + 1
 
-	score_matrix := make([]u16, rows * cols)
-	defer delete(score_matrix)
-
-	haystack_gap_matrix := make([]u16, rows * cols)
-	defer delete(haystack_gap_matrix)
+	score_matrix := make([]u16, rows * cols, allocator)
+	// defer delete(score_matrix)
+	haystack_gap_matrix := make([]u16, rows * cols, allocator)
+	// defer delete(haystack_gap_matrix)
 
 	for i in 1..=needle_len {
 		for j in 1 ..=haystack_len {
@@ -62,7 +126,6 @@ smith_waterman :: proc(needle, haystack: string) -> u16 {
 
 			score_matrix[i * cols + j] = max(diagonal, haystack_gap_matrix[i * cols + j])
 		}
-
 	}
 
 	best: u16 = 0
@@ -76,33 +139,89 @@ main :: proc() {
 	args := os.args
 	fmt.println("Args:", args)
 	if len(args) < 2 {
-		fmt.eprintln("Usage: fast-fuzzy-matcher <query>")
+		fmt.eprintln("Usage: fast-fuzzy-matcher <query> [threads]")
 		os.exit(1)
 	}
 	needle := args[1]
+	thread_count := max(1, os.get_processor_core_count())
+	for arg in args[2:] {
+		parsed_threads, ok := strconv.parse_int(arg)
+		if !ok || parsed_threads <= 0 {
+			fmt.eprintln("Invalid thread count:", arg, "(must be a positive integer)")
+			os.exit(1)
+		}
+		thread_count = parsed_threads
+	}
 
-	fmt.println("Searching for:", needle)
-
-	candidates: [dynamic]Candidate
-	defer delete(candidates)
+	fmt.println("Searching for:", needle, "with", thread_count, "threads")
 
 	reader: bufio.Scanner
 	bufio.scanner_init(&reader, os.to_stream(os.stdin))
 	defer bufio.scanner_destroy(&reader)
 
-	total := 0
+	all_lines: [dynamic]string
+	defer {
+		for line in all_lines do delete(line)
+		delete(all_lines)
+	}
+
 	for bufio.scanner_scan(&reader) {
 		current_line := bufio.scanner_text(&reader)
-		total += 1
+		append(&all_lines, strings.clone(current_line))
+	}
 
-		score := smith_waterman(needle, current_line)
-		if score > 0 {
-			append(&candidates, Candidate{
-				line = strings.clone(current_line),
-				score = score
-			})
+	chunk_size := 512
+
+	dispatcher := Work_Dispatcher{
+		query = needle,
+		lines = all_lines[:],
+		chunk_size = chunk_size,
+		chunk_count = (len(all_lines) + chunk_size - 1) / chunk_size,
+		next_chunk_index = 0,
+	}
+
+	worker_results := make([]Worker_Result, thread_count)
+	defer {
+		for result in worker_results do delete(result.local_candidates)
+		delete(worker_results)
+	}
+
+	threads := make([]^thread.Thread, thread_count)
+	defer delete(threads)
+
+	for i in 0..<thread_count {
+		worker_results[i].dispacther = &dispatcher
+		threads[i] = thread.create_and_start_with_poly_data(&worker_results[i], worker_match_lines)
+	}
+
+	for t in threads {
+		thread.destroy(t)
+	}
+
+	// Merge results
+	candidates: [dynamic]Candidate
+	defer delete(candidates)
+
+	for result in worker_results {
+		for c in result.local_candidates {
+			append(&candidates, c)
 		}
 	}
+
+	// total := 0
+	// for bufio.scanner_scan(&reader) {
+	// 	current_line := bufio.scanner_text(&reader)
+	// 	total += 1
+
+	// 	score := smith_waterman(needle, current_line)
+	// 	if score > 0 {
+	// 		append(&candidates, Candidate{
+	// 			line = strings.clone(current_line),
+	// 			score = score
+	// 		})
+	// 	}
+	// 	// mem.arena_free_all(&arena)
+	// }
 
 	slice.sort_by(candidates[:], proc(a, b: Candidate) -> bool {
 		return a.score > b.score
@@ -112,7 +231,7 @@ main :: proc() {
 		fmt.println(c.line)
 	}
 
-	fmt.printfln("Found %d candidates from %d", len(candidates), total)
+	fmt.printfln("Found %d candidates from %d", len(candidates), len(all_lines))
 }
 
 @(test)
